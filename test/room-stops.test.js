@@ -5,6 +5,9 @@
 // 播放连续经过停点准确暂停并显示原因（自动暂停不加修订号）、继续播放越过刚触发的停点、
 // 手动跳转跳到停点不立即触发、循环排演每次重新经过仍暂停、段尾瞬时跳转不触发跳过的停点、
 // 超载边界与停点取先抵达者（同一时码优先超载）、观看者只读、交接后延续、重启恢复。
+// 整组替换的生效时序：播放中替换先按旧组结算此前已发生的播放与自动暂停（固化为新锚点），
+// 新组只作用于此后连续经过的时码——不倒退错停早已经过的新停点、不漏停旧组未触发的停点；
+// 循环排演替换先结算段/轮次，新停点在后续轮次仍逐轮触发；保护房间替换同样先结算超载边界。
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -431,6 +434,180 @@ test('停点组替换：当前触发标记对应的时码不在新组内则清�
   assert.equal(r.json.stops.tripped, undefined, '0.3 不在新组：触发标记清除');
   assert.equal(r.json.playing, false);
   assert.ok(Math.abs(r.json.time - 0.3) < 1e-6);
+});
+
+test('播放中整组替换：先按旧组结算锚点，新组只作用于此后的时码（不倒退、不错停早已经过的新停点）', async () => {
+  const v = await seedPlainVersion(); // 末尾 10 秒，时序余量充足
+  const c = (await createRoom(v.id)).json;
+  const ctrl = (body) => request('POST', ctrlUrl(c.code), { control_key: c.control_key, ...body });
+
+  await ctrl({ revision: 0, action: 'play' });
+  await sleep(600); // 播放推进到约 0.6 秒（期间无任何查询）
+
+  // 播放中提交新组 [0.3, 1.5]：0.3 已经过。替换先把结算位置（≈0.6）固化为新锚点，
+  // 新组只作用于锚点之后——不得倒退到 0.3 错停
+  const put = await request('PUT', stopsUrl(c.code), {
+    control_key: c.control_key,
+    revision: 1,
+    stops: [0.3, 1.5],
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.revision, 2, '成功替换只 +1 次修订号');
+  assert.equal(put.json.playing, true, '结算后未到新停点：继续播放');
+  assert.ok(put.json.time > 0.4 && put.json.time < 1.4, `结算锚点 ≈0.6，time=${put.json.time}`);
+  assert.deepEqual(put.json.stops.points, [0.3, 1.5]);
+  assert.ok(put.json.stops.next, '应预告下一停点');
+  assert.ok(Math.abs(put.json.stops.next.time - 1.5) < 1e-6, '早已经过的 0.3 不再是下一停点');
+  assert.equal(put.json.stops.tripped, undefined);
+
+  // 后续查询不倒退、不停在 0.3
+  let g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, true);
+  assert.ok(g.json.time >= put.json.time - 1e-6, `时码不倒退：${g.json.time} >= ${put.json.time}`);
+  assert.equal(g.json.stops.tripped, undefined);
+
+  // 继续前进，连续经过 1.5 时准确暂停
+  await sleep(1100);
+  g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, false);
+  assert.ok(Math.abs(g.json.time - 1.5) < 1e-6, `应停在新停点 1.5，time=${g.json.time}`);
+  assert.ok(Math.abs(g.json.stops.tripped.time - 1.5) < 1e-6);
+  assert.equal(g.json.revision, 2, '自动暂停不增加修订号');
+});
+
+test('播放中整组替换：旧组停点尚未被查询触发，替换删除它之前先按旧组结算（不漏停）', async () => {
+  const v = await seedPlainVersion(); // 末尾 10 秒
+  const c = (await createRoom(v.id)).json;
+  const ctrl = (body) => request('POST', ctrlUrl(c.code), { control_key: c.control_key, ...body });
+
+  // 旧组 [1.0]；播放经过 1.0 后不做任何查询（自动暂停尚未惰性落库）
+  await request('PUT', stopsUrl(c.code), { control_key: c.control_key, revision: 0, stops: [1.0] });
+  await ctrl({ revision: 1, action: 'play' });
+  await sleep(1300); // 已连续经过旧停点 1.0
+
+  // 替换为 [2.0]（删掉 1.0）：先按旧组结算——房间应已自动暂停在 1.0，不能漏停；
+  // 1.0 不在新组内，触发标记按既有规则清除，但房间保持暂停在 1.0
+  const put = await request('PUT', stopsUrl(c.code), {
+    control_key: c.control_key,
+    revision: 2,
+    stops: [2.0],
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.revision, 3, '成功替换只 +1 次修订号（结算出的自动暂停不另加）');
+  assert.equal(put.json.playing, false, '旧停点 1.0 在替换前已触发：房间暂停在此');
+  assert.ok(Math.abs(put.json.time - 1.0) < 1e-6, `结算停在旧停点 1.0，time=${put.json.time}`);
+  assert.deepEqual(put.json.stops.points, [2.0]);
+  assert.equal(put.json.stops.tripped, undefined, '1.0 不在新组：触发标记清除');
+
+  // 已落库：再查仍暂停在 1.0（不漏停、不继续走）
+  let g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, false);
+  assert.ok(Math.abs(g.json.time - 1.0) < 1e-6);
+  assert.equal(g.json.revision, 3);
+
+  // 继续播放：从 1.0 前进，连续经过新停点 2.0 再次暂停
+  await ctrl({ revision: 3, action: 'play' });
+  await sleep(1200);
+  g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, false);
+  assert.ok(Math.abs(g.json.time - 2.0) < 1e-6, `应停在新停点 2.0，time=${g.json.time}`);
+  assert.ok(Math.abs(g.json.stops.tripped.time - 2.0) < 1e-6);
+});
+
+test('播放中整组替换：旧组停点结算后仍在新组内，触发标记随替换保留', async () => {
+  const v = await seedPlainVersion();
+  const c = (await createRoom(v.id)).json;
+  const ctrl = (body) => request('POST', ctrlUrl(c.code), { control_key: c.control_key, ...body });
+
+  await request('PUT', stopsUrl(c.code), { control_key: c.control_key, revision: 0, stops: [1.0] });
+  await ctrl({ revision: 1, action: 'play' });
+  await sleep(1300); // 已经过旧停点 1.0（未查询落库）
+
+  // 新组 [1.0, 2.0] 仍含 1.0：结算停在 1.0 且触发标记保留（暂停原因仍显示）
+  const put = await request('PUT', stopsUrl(c.code), {
+    control_key: c.control_key,
+    revision: 2,
+    stops: [1.0, 2.0],
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.playing, false);
+  assert.ok(Math.abs(put.json.time - 1.0) < 1e-6);
+  assert.ok(put.json.stops.tripped, '1.0 仍在新组：触发标记保留');
+  assert.ok(Math.abs(put.json.stops.tripped.time - 1.0) < 1e-6);
+  assert.equal(put.json.revision, 3);
+
+  const g = await request('GET', `/api/rooms/${c.code}`);
+  assert.ok(g.json.stops.tripped, '刷新后触发原因仍在');
+  assert.ok(Math.abs(g.json.time - 1.0) < 1e-6);
+});
+
+test('循环排演播放中整组替换：先结算段/轮次锚点，新停点在后续轮次连续经过时仍逐轮触发', async () => {
+  const v = await seedShortVersion(); // 末尾 1 秒
+  const c = (await createRoom(v.id)).json;
+
+  // 段 [0.2, 0.8] 重复 3 轮，提交即从 0.2 开始播放
+  const prog = await request('POST', `/api/rooms/${c.code}/program`, {
+    control_key: c.control_key,
+    revision: 0,
+    segments: [{ start: 0.2, end: 0.8, repeat: 3 }],
+  });
+  assert.equal(prog.status, 200);
+  await sleep(900); // 第 1 轮 0.2→0.8 走完，第 2 轮推进到约 0.5（已经过 0.4）
+
+  // 播放中提交新停点 0.4：本轮（第 2 轮）已经过 0.4，不得倒退错停；
+  // 结算把当前段/轮/时码固化为新锚点，0.4 只作用于此后连续经过的时码（第 3 轮再经过）
+  const put = await request('PUT', stopsUrl(c.code), {
+    control_key: c.control_key,
+    revision: 1,
+    stops: [0.4],
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.revision, 2);
+  assert.equal(put.json.playing, true, '本轮已越过 0.4：不倒退错停，继续播放');
+  assert.equal(put.json.program.loop, 2, '结算后仍在第 2 轮');
+  assert.ok(put.json.time > 0.4 && put.json.time <= 0.8, `段内时码 ≈0.5，time=${put.json.time}`);
+
+  // 第 2 轮走完跳回 0.2，第 3 轮重新连续经过 0.4：准确暂停
+  await sleep(800);
+  const g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, false);
+  assert.ok(Math.abs(g.json.time - 0.4) < 1e-6, `第 3 轮重新经过 0.4 暂停，time=${g.json.time}`);
+  assert.equal(g.json.program.loop, 3, '停在第 3 轮');
+  assert.ok(Math.abs(g.json.stops.tripped.time - 0.4) < 1e-6);
+  assert.equal(g.json.revision, 2, '自动暂停不增加修订号');
+});
+
+test('保护房间播放中整组替换：先按旧组结算超载边界（同刻停点超载优先），新组照常生效', async () => {
+  const { version } = await seedProtectedVersion(); // 超载区间 [0.3, 1)，闭左边界 0.3；末尾 1 秒
+  const c = (await createRoom(version.id, { overload_protection: true })).json;
+  const ctrl = (body) => request('POST', ctrlUrl(c.code), { control_key: c.control_key, ...body });
+
+  // 旧组停点 0.3 与超载边界同刻；播放越过 0.3 后不查询（触发尚未落库）
+  await request('PUT', stopsUrl(c.code), { control_key: c.control_key, revision: 0, stops: [0.3] });
+  await ctrl({ revision: 1, action: 'play' });
+  await sleep(500);
+
+  // 播放中替换为 [0.9]：先按旧组 + 超载规则结算——同刻超载优先，房间已自动暂停在边界 0.3
+  const put = await request('PUT', stopsUrl(c.code), {
+    control_key: c.control_key,
+    revision: 2,
+    stops: [0.9],
+  });
+  assert.equal(put.status, 200);
+  assert.equal(put.json.revision, 3, '成功替换只 +1 次修订号（结算出的自动暂停不另加）');
+  assert.equal(put.json.playing, false);
+  assert.ok(Math.abs(put.json.time - 0.3) < 1e-6, `结算停在超载边界 0.3，time=${put.json.time}`);
+  assert.ok(put.json.protection.tripped, '同刻超载优先：报超载触发');
+  assert.equal(put.json.protection.tripped.reason, 'overload_boundary');
+  assert.equal(put.json.stops.tripped, undefined, '同刻停点不触发');
+  assert.deepEqual(put.json.stops.points, [0.9]);
+
+  // 已落库：再查仍暂停在边界、触发原因仍在
+  const g = await request('GET', `/api/rooms/${c.code}`);
+  assert.equal(g.json.playing, false);
+  assert.ok(Math.abs(g.json.time - 0.3) < 1e-6);
+  assert.ok(g.json.protection.tripped);
+  assert.equal(g.json.revision, 3);
 });
 
 test('观看者只读：GET 可见停点列表与状态但无密钥；提交停点 403', async () => {

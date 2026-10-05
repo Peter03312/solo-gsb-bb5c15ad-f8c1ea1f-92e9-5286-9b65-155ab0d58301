@@ -2720,6 +2720,10 @@ app.post('/api/rooms/:code/program/clear', (req, res) => {
 // 不重复的非负演出时码（不超过房间固定版本末尾），整组校验后原子替换；空组表示
 // 清除全部停点。无权、过期修订号或非法时码均不改变房间；成功替换修订号 +1
 // （与成功控制同一口径，已发出的交接凭证随之作废）。
+// 整组替换的生效时序：提交时先按【旧组】结算此前已发生的播放与自动暂停（到末尾
+// 停住 / 超载边界 / 旧停点触发都在此固化），把结算位置固化为新锚点，新组只作用于
+// 该锚点之后连续经过的时码——不会用旧锚点配合新停点重算（时码不倒退、不错停在
+// 早已经过的新停点上），旧组中尚未被查询触发的停点也不会因替换而漏停。
 // 播放按服务端墙钟连续经过下一停点时准确暂停在该停点并显示原因（惰性落库
 // rooms.stopped_time，自动暂停不增加修订号）；继续播放越过刚触发的停点，循环
 // 排演每次重新经过仍暂停，段尾瞬时跳转不触发被跳过的停点；与超载边界同时
@@ -2779,6 +2783,7 @@ app.put('/api/rooms/:code/stops', (req, res) => {
   if (checked.message) return err(res, checked.status, checked.message);
   const stops = checked.stops;
 
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
     let cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
@@ -2798,6 +2803,71 @@ app.put('/api/rooms/:code/stops', (req, res) => {
     activateDueScheduleTx(cur.id, now);
     cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
     db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
+
+    // 生效时序：先按【旧组】结算此前已发生的播放与自动暂停（到末尾停住 /
+    // 超载边界 / 旧停点触发，含循环排演的段轮推进），把结算位置固化为新锚点；
+    // 新组随后只作用于该锚点之后连续经过的时码。否则播放中替换会用旧锚点
+    // 配合新停点重算——时码倒退并错停在早已经过的新停点上；旧组中尚未被
+    // 查询触发的停点也会随替换被漏掉。
+    const oldStops = getRoomStops(cur.id);
+    const curProg = getRoomProgram(cur.id);
+    const live = computeRoomState(cur, { now, guard, prog: curProg, stops: oldStops });
+
+    // 结算后的自动暂停标记：本次结算新撞上的边界/停点优先；未新撞上且房间
+    // 本就暂停时沿用已落库标记（播放中的房间没有标记；到末尾停住清除全部标记）
+    let tripCircuit = null;
+    let tripTime = null;
+    let stoppedTime = null;
+    if (live.trip) {
+      tripCircuit = live.trip.circuit_id;
+      tripTime = live.trip.time;
+    } else if (live.stopTrip) {
+      stoppedTime = live.stopTrip.time;
+    } else if (!live.playing && !live.ended) {
+      tripCircuit = cur.tripped_circuit_id ?? null;
+      tripTime = cur.tripped_time ?? null;
+      stoppedTime = cur.stopped_time ?? null;
+    }
+    // 停点自动暂停标记对应的时码已不在新组内：清除该标记（仍在组内则保留暂停原因）
+    if (stoppedTime !== null && !stops.some((s) => Math.abs(s - stoppedTime) <= ROOM_EPS)) {
+      stoppedTime = null;
+    }
+
+    // 结算位置固化为新锚点（结算出的自动暂停不增加修订号；仅本次替换 +1）
+    db.prepare(
+      `UPDATE rooms
+       SET playing = ?, time = ?, anchor_wall = ?,
+           tripped_circuit_id = ?, tripped_time = ?, stopped_time = ?,
+           scheduled_start_at = NULL, revision = revision + 1
+       WHERE id = ?`
+    ).run(
+      live.playing ? 1 : 0,
+      live.time,
+      now,
+      tripCircuit,
+      tripTime,
+      stoppedTime,
+      cur.id
+    );
+    if (curProg) {
+      // 循环排演：结算后的当前段/轮次/段内时码一并固化（断点接续；
+      // 段尾瞬时跳转不触发被跳过的停点由推进引擎保证）
+      db.prepare(
+        `INSERT INTO room_programs (room_id, segments, seg_index, iteration, prog_time, finished)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(room_id) DO UPDATE SET
+           segments = excluded.segments, seg_index = excluded.seg_index,
+           iteration = excluded.iteration, prog_time = excluded.prog_time,
+           finished = excluded.finished`
+      ).run(
+        cur.id,
+        JSON.stringify(curProg.segments),
+        live.prog.segIndex,
+        live.prog.iteration,
+        live.prog.time,
+        live.prog.finished ? 1 : 0
+      );
+    }
     // 整组原子替换：空组 = 清除全部停点（删除行）
     if (stops.length === 0) {
       db.prepare('DELETE FROM room_stops WHERE room_id = ?').run(cur.id);
@@ -2807,15 +2877,6 @@ app.put('/api/rooms/:code/stops', (req, res) => {
          ON CONFLICT(room_id) DO UPDATE SET stops = excluded.stops`
       ).run(cur.id, JSON.stringify(stops));
     }
-    // 当前停点自动暂停标记对应的时码已不在新组内：清除该标记（仍在组内则保留暂停原因）
-    const keepStopped =
-      cur.stopped_time !== null &&
-      cur.stopped_time !== undefined &&
-      stops.some((s) => Math.abs(s - cur.stopped_time) <= ROOM_EPS);
-    db.prepare('UPDATE rooms SET revision = revision + 1, stopped_time = ?, scheduled_start_at = NULL WHERE id = ?').run(
-      keepStopped ? cur.stopped_time : null,
-      cur.id
-    );
     return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
   });
 
@@ -2836,7 +2897,6 @@ app.put('/api/rooms/:code/stops', (req, res) => {
     throw e;
   }
 
-  const guard = updated.overload_protection ? loadRoomGuard(updated.version_id) : null;
   const prog = getRoomProgram(updated.id);
   const sched = getRoomSchedule(updated.id);
   const state = computeRoomState(updated, { now, guard, prog, stops });
