@@ -2779,6 +2779,7 @@ app.put('/api/rooms/:code/stops', (req, res) => {
   if (checked.message) return err(res, checked.status, checked.message);
   const stops = checked.stops;
 
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
     let cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
@@ -2798,6 +2799,29 @@ app.put('/api/rooms/:code/stops', (req, res) => {
     activateDueScheduleTx(cur.id, now);
     cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
     db.prepare('DELETE FROM room_schedules WHERE room_id = ?').run(cur.id);
+
+    // 整组替换的生效时序：先按【旧停点组】结算此前已发生的播放与自动暂停
+    // （与 GET 的惰性落库同一口径：旧组停点 / 超载边界 / 段尾 / 版本末尾，
+    // 自动暂停不增加修订号），再让新组只作用于提交之后连续经过的时码——
+    // 旧锚点不得与新停点重算，否则播放已越过某停点时新组会让查询倒退并错停，
+    // 而尚未被查询触发的旧停点又会因删组而漏停。
+    const oldProg = getRoomProgram(cur.id);
+    const oldStops = getRoomStops(cur.id);
+    const live = computeRoomState(cur, { now, guard, persistStopped: true, prog: oldProg, stops: oldStops });
+    if (live.playing) {
+      // 结算后仍在播放：以结算时码为新锚点（段/轮/段内时码一并固化）。
+      // 新组停点从此锚点前方才可能连续经过；锚点上或身后的停点不触发。
+      db.prepare(
+        'UPDATE rooms SET time = ?, anchor_wall = ? WHERE id = ?'
+      ).run(live.time, now, cur.id);
+      if (oldProg) {
+        db.prepare(
+          'UPDATE room_programs SET seg_index = ?, iteration = ?, prog_time = ?, finished = 0 WHERE room_id = ?'
+        ).run(live.prog.segIndex, live.prog.iteration, live.prog.time, cur.id);
+      }
+      cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
+    }
+
     // 整组原子替换：空组 = 清除全部停点（删除行）
     if (stops.length === 0) {
       db.prepare('DELETE FROM room_stops WHERE room_id = ?').run(cur.id);
@@ -2807,7 +2831,9 @@ app.put('/api/rooms/:code/stops', (req, res) => {
          ON CONFLICT(room_id) DO UPDATE SET stops = excluded.stops`
       ).run(cur.id, JSON.stringify(stops));
     }
-    // 当前停点自动暂停标记对应的时码已不在新组内：清除该标记（仍在组内则保留暂停原因）
+    // 当前停点自动暂停标记对应的时码已不在新组内：清除该标记（仍在组内则保留暂停原因）。
+    // 这同时覆盖“旧组结算刚刚停在一个被新组删除的停点”的情形：房间保持暂停在该时码，
+    // 但它不再是新组停点触发，继续播放会从该锚点越过（新组只作用于此后连续经过的时码）。
     const keepStopped =
       cur.stopped_time !== null &&
       cur.stopped_time !== undefined &&
@@ -2836,7 +2862,6 @@ app.put('/api/rooms/:code/stops', (req, res) => {
     throw e;
   }
 
-  const guard = updated.overload_protection ? loadRoomGuard(updated.version_id) : null;
   const prog = getRoomProgram(updated.id);
   const sched = getRoomSchedule(updated.id);
   const state = computeRoomState(updated, { now, guard, prog, stops });
